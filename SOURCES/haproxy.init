@@ -40,6 +40,10 @@ CFG=/etc/$BASENAME/$BASENAME.cfg
 PIDFILE=/var/run/$BASENAME.pid
 LOCKFILE=/var/lock/subsys/$BASENAME
 
+if [ -f /etc/sysconfig/haproxy ] ; then
+  . /etc/sysconfig/haproxy
+fi
+
 RETVAL=0
 
 start() {
