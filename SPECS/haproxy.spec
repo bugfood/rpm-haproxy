@@ -29,6 +29,7 @@ Source2: %{name}.service
 Source3: %{name}.logrotate
 Source4: %{name}.syslog%{?dist}
 Source5: halog.1
+Patch0: trace-backport-v1.diff
 BuildRoot: %{_tmppath}/%{name}-%{version}-root
 
 BuildRequires: pcre-devel
@@ -72,6 +73,7 @@ risking the system's stability.
 
 %prep
 %setup -q
+%patch0 -p1
 
 # We don't want any perl dependecies in this RPM:
 %define __perl_requires /bin/true

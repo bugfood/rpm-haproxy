@@ -1,0 +1,433 @@
+commit 20518318a54e88315742bf526fea9056e4dbd4f3
+Author: Willy Tarreau <w@1wt.eu>
+Date:   Sat 2021-03-06 09:17:47
+
+    DEBUG: record trace points in the path from process_stream() to socket()
+    
+    Now in case of crash, let's just open gdb with the core on the crashed
+    thread and issue:
+    
+    (gdb) set print array-indexes on
+    (gdb) p ti->records
+    
+    This will show the entry dates (both cpu and mono) for each function,
+    and their execution time, with the number of calls since the last
+    entry in process_stream(), and the code line number where the function
+    returned.
+    
+    Backported to 2.2 by Corey Hickey, 2021-04-12.
+    
+    Conflicts:
+            include/haproxy/tinfo-t.h
+            src/backend.c
+            src/sock.c
+
+diff --git a/include/haproxy/stream_interface.h b/include/haproxy/stream_interface.h
+index 66159d581..fd1ad134c 100644
+--- a/include/haproxy/stream_interface.h
++++ b/include/haproxy/stream_interface.h
+@@ -494,8 +494,12 @@ static inline int si_connect(struct stream_interface *si, struct connection *con
+ 	int ret = SF_ERR_NONE;
+ 	int conn_flags = 0;
+ 
+-	if (unlikely(!conn || !conn->ctrl || !conn->ctrl->connect))
++	RECORD_ENTER(REC_SI_CONNECT);
++
++	if (unlikely(!conn || !conn->ctrl || !conn->ctrl->connect)) {
++		RECORD_LEAVE(REC_SI_CONNECT);
+ 		return SF_ERR_INTERNAL;
++	}
+ 
+ 	if (!channel_is_empty(si_oc(si)))
+ 		conn_flags |= CONNECT_HAS_DATA;
+@@ -503,8 +507,10 @@ static inline int si_connect(struct stream_interface *si, struct connection *con
+ 		conn_flags |= CONNECT_CAN_USE_TFO;
+ 	if (!conn_ctrl_ready(conn) || !conn_xprt_ready(conn)) {
+ 		ret = conn->ctrl->connect(conn, conn_flags);
+-		if (ret != SF_ERR_NONE)
++		if (ret != SF_ERR_NONE) {
++			RECORD_LEAVE(REC_SI_CONNECT);
+ 			return ret;
++		}
+ 
+ 		/* we're in the process of establishing a connection */
+ 		si->state = SI_ST_CON;
+@@ -524,6 +530,7 @@ static inline int si_connect(struct stream_interface *si, struct connection *con
+ 	if (si->flags & SI_FL_SRC_ADDR)
+ 		conn_get_src(conn);
+ 
++	RECORD_LEAVE(REC_SI_CONNECT);
+ 	return ret;
+ }
+ 
+diff --git a/include/haproxy/tinfo-t.h b/include/haproxy/tinfo-t.h
+index f3badbd88..61eafabc6 100644
+--- a/include/haproxy/tinfo-t.h
++++ b/include/haproxy/tinfo-t.h
+@@ -45,9 +45,43 @@ struct thread_info {
+ #ifdef CONFIG_HAP_LOCAL_POOLS
+ 	struct list pool_lru_head;                         /* oldest objects   */
+ #endif
++
++
++#define REC_PROC_STRM       0
++#define REC_BACK_TRY_CR     1
++#define REC_CONN_SERVER     2
++#define REC_SI_CONNECT      3
++#define REC_TCP_CONN_SERVER 4
++#define REC_SOCK_CREATE     5
++#define REC_MY_SOCKETAT     6
++#define REC_SOCKET          7
++
++	ALWAYS_ALIGN(32);
++	struct {
++		uint64_t cpu_enter;
++		uint64_t mono_enter;
++		uint32_t cpu_time;
++		uint32_t mono_time;
++		uint32_t calls;
++		uint32_t line;
++	} records[8];
+ 	/* pad to cache line (64B) */
+ 	char __pad[0];            /* unused except to check remaining room */
+ 	char __end[0] __attribute__((aligned(64)));
+ };
+ 
++#define RECORD_ENTER(where) do {					\
++		ti->records[where].cpu_enter = now_cpu_time();		\
++		ti->records[where].mono_enter = now_mono_time();	\
++		ti->records[where].calls++;				\
++		__ha_barrier_store();					\
++	} while (0)
++
++#define RECORD_LEAVE(where) do {					\
++		ti->records[where].cpu_time = now_cpu_time() - ti->records[where].cpu_enter;	\
++		ti->records[where].mono_time = now_mono_time() - ti->records[where].mono_enter;	\
++		ti->records[where].line = __LINE__;			\
++		__ha_barrier_store();					\
++	} while (0)
++
+ #endif /* _HAPROXY_TINFO_T_H */
+diff --git a/src/backend.c b/src/backend.c
+index 5ffcb29a0..052495a3d 100644
+--- a/src/backend.c
++++ b/src/backend.c
+@@ -1212,7 +1212,7 @@ int connect_server(struct stream *s)
+ 	int init_mux = 0;
+ 	int err;
+ 	int was_unused = 0;
+-
++	RECORD_ENTER(REC_CONN_SERVER);
+ 
+ 	/* This will catch some corner cases such as lying connections resulting from
+ 	 * retries or connect timeouts but will rarely trigger.
+@@ -1426,6 +1426,7 @@ int connect_server(struct stream *s)
+ 	if (!srv_conn || !sockaddr_alloc(&srv_conn->dst)) {
+ 		if (srv_conn)
+ 			conn_free(srv_conn);
++        RECORD_LEAVE(REC_CONN_SERVER);
+ 		return SF_ERR_RESOURCE;
+ 	}
+ 
+@@ -1433,6 +1434,7 @@ int connect_server(struct stream *s)
+ 		err = assign_server_address(s);
+ 		if (err != SRV_STATUS_OK) {
+ 			conn_free(srv_conn);
++            RECORD_LEAVE(REC_CONN_SERVER);
+ 			return SF_ERR_INTERNAL;
+ 		}
+ 	}
+@@ -1452,17 +1454,20 @@ int connect_server(struct stream *s)
+ 			conn_prepare(srv_conn, protocol_by_family(srv_conn->dst->ss_family), xprt_get(XPRT_RAW));
+ 			if (!(srv_conn->ctrl)) {
+ 				conn_free(srv_conn);
++                RECORD_LEAVE(REC_CONN_SERVER);
+ 				return SF_ERR_INTERNAL;
+ 			}
+ 		}
+ 		else {
+ 			conn_free(srv_conn);
++			RECORD_LEAVE(REC_CONN_SERVER);
+ 			return SF_ERR_INTERNAL;  /* how did we get there ? */
+ 		}
+ 
+ 		srv_cs = si_alloc_cs(&s->si[1], srv_conn);
+ 		if (!srv_cs) {
+ 			conn_free(srv_conn);
++            RECORD_LEAVE(REC_CONN_SERVER);
+ 			return SF_ERR_RESOURCE;
+ 		}
+ 		srv_conn->ctx = srv_cs;
+@@ -1525,8 +1530,10 @@ int connect_server(struct stream *s)
+ 	}
+ 
+ 	err = si_connect(&s->si[1], srv_conn);
+-	if (err != SF_ERR_NONE)
++	if (err != SF_ERR_NONE) {
++		RECORD_LEAVE(REC_CONN_SERVER);
+ 		return err;
++	}
+ 
+ 	/* The CO_FL_SEND_PROXY flag may have been set by the connect method,
+ 	 * if so, add our handshake pseudo-XPRT now.
+@@ -1534,6 +1541,7 @@ int connect_server(struct stream *s)
+ 	if ((srv_conn->flags & CO_FL_HANDSHAKE)) {
+ 		if (xprt_add_hs(srv_conn) < 0) {
+ 			conn_full_close(srv_conn);
++			RECORD_LEAVE(REC_CONN_SERVER);
+ 			return SF_ERR_INTERNAL;
+ 		}
+ 	}
+@@ -1546,6 +1554,7 @@ int connect_server(struct stream *s)
+ 	if (init_mux) {
+ 		if (conn_install_mux_be(srv_conn, srv_cs, s->sess) < 0) {
+ 			conn_full_close(srv_conn);
++			RECORD_LEAVE(REC_CONN_SERVER);
+ 			return SF_ERR_INTERNAL;
+ 		}
+ 		/* If we're doing http-reuse always, and the connection is not
+@@ -1643,10 +1652,12 @@ int connect_server(struct stream *s)
+ 	if (!srv_conn->mux && !(srv_conn->flags & CO_FL_WAIT_XPRT)) {
+ 		if (conn_create_mux(srv_conn) < 0) {
+ 			conn_full_close(srv_conn);
++			RECORD_LEAVE(REC_CONN_SERVER);
+ 			return SF_ERR_INTERNAL;
+ 		}
+ 	}
+ 
++	RECORD_LEAVE(REC_CONN_SERVER);
+ 	return SF_ERR_NONE;  /* connection is OK */
+ }
+ 
+@@ -1760,6 +1771,8 @@ void back_try_conn_req(struct stream *s)
+ 
+ 	DBG_TRACE_ENTER(STRM_EV_STRM_PROC|STRM_EV_SI_ST, s);
+ 
++	RECORD_ENTER(REC_BACK_TRY_CR);
++
+ 	if (si->state == SI_ST_ASS) {
+ 		/* Server assigned to connection request, we have to try to connect now */
+ 		int conn_err;
+@@ -1902,8 +1915,10 @@ void back_try_conn_req(struct stream *s)
+ 			goto abort_connection;
+ 		}
+ 
+-		if (!(si->flags & SI_FL_EXP))
++		if (!(si->flags & SI_FL_EXP)) {
++			RECORD_LEAVE(REC_BACK_TRY_CR);
+ 			return;  /* still in turn-around */
++		}
+ 
+ 		si->flags &= ~SI_FL_EXP;
+ 		si->exp = TICK_ETERNITY;
+@@ -1921,6 +1936,7 @@ void back_try_conn_req(struct stream *s)
+ 	}
+ 
+   end:
++	RECORD_LEAVE(REC_BACK_TRY_CR);
+ 	DBG_TRACE_LEAVE(STRM_EV_STRM_PROC|STRM_EV_SI_ST, s);
+ 	return;
+ 
+@@ -1934,6 +1950,7 @@ void back_try_conn_req(struct stream *s)
+ 	if (s->srv_error)
+ 		s->srv_error(s, si);
+ 	DBG_TRACE_DEVEL("leaving on error", STRM_EV_STRM_PROC|STRM_EV_SI_ST|STRM_EV_STRM_ERR, s);
++	RECORD_LEAVE(REC_BACK_TRY_CR);
+ 	return;
+ }
+ 
+diff --git a/src/namespace.c b/src/namespace.c
+index 1fc843906..24b11a861 100644
+--- a/src/namespace.c
++++ b/src/namespace.c
+@@ -115,16 +115,23 @@ int my_socketat(const struct netns_entry *ns, int domain, int type, int protocol
+ {
+ 	int sock;
+ 
+-	if (default_namespace >= 0 && ns && setns(ns->fd, CLONE_NEWNET) == -1)
++	RECORD_ENTER(REC_MY_SOCKETAT);
++	if (default_namespace >= 0 && ns && setns(ns->fd, CLONE_NEWNET) == -1) {
++		RECORD_LEAVE(REC_MY_SOCKETAT);
+ 		return -1;
++	}
+ 
++	RECORD_ENTER(REC_SOCKET);
+ 	sock = socket(domain, type, protocol);
++	RECORD_LEAVE(REC_SOCKET);
+ 
+ 	if (default_namespace >= 0 && ns && setns(default_namespace, CLONE_NEWNET) == -1) {
+ 		if (sock >= 0)
+ 			close(sock);
++		RECORD_LEAVE(REC_MY_SOCKETAT);
+ 		return -1;
+ 	}
++	RECORD_LEAVE(REC_MY_SOCKETAT);
+ 	return sock;
+ }
+ 
+diff --git a/src/proto_tcp.c b/src/proto_tcp.c
+index caf36f6e1..0d7907296 100644
+--- a/src/proto_tcp.c
++++ b/src/proto_tcp.c
+@@ -236,8 +236,11 @@ int tcp_bind_socket(int fd, int flags, struct sockaddr_storage *local, struct so
+ /* conn->dst MUST be valid */
+ static int create_server_socket(struct connection *conn)
+ {
++    int ret;
+ 	const struct netns_entry *ns = NULL;
+ 
++    RECORD_ENTER(REC_SOCK_CREATE);
++
+ #ifdef USE_NS
+ 	if (objt_server(conn->target)) {
+ 		if (__objt_server(conn->target)->flags & SRV_F_USE_NS_FROM_PP)
+@@ -246,7 +249,9 @@ static int create_server_socket(struct connection *conn)
+ 			ns = __objt_server(conn->target)->netns;
+ 	}
+ #endif
+-	return my_socketat(ns, conn->dst->ss_family, SOCK_STREAM, IPPROTO_TCP);
++	ret = my_socketat(ns, conn->dst->ss_family, SOCK_STREAM, IPPROTO_TCP);
++    RECORD_LEAVE(REC_SOCK_CREATE);
++    return ret;
+ }
+ 
+ /*
+@@ -288,6 +293,8 @@ int tcp_connect_server(struct connection *conn, int flags)
+ 	int use_fastopen = 0;
+ 	struct sockaddr_storage *addr;
+ 
++	RECORD_ENTER(REC_TCP_CONN_SERVER);
++
+ 	conn->flags |= CO_FL_WAIT_L4_CONN; /* connection in progress */
+ 
+ 	switch (obj_type(conn->target)) {
+@@ -309,11 +316,13 @@ int tcp_connect_server(struct connection *conn, int flags)
+ 		break;
+ 	default:
+ 		conn->flags |= CO_FL_ERROR;
++		RECORD_LEAVE(REC_TCP_CONN_SERVER);
+ 		return SF_ERR_INTERNAL;
+ 	}
+ 
+ 	if (!conn->dst) {
+ 		conn->flags |= CO_FL_ERROR;
++		RECORD_LEAVE(REC_TCP_CONN_SERVER);
+ 		return SF_ERR_INTERNAL;
+ 	}
+ 
+@@ -348,6 +357,7 @@ int tcp_connect_server(struct connection *conn, int flags)
+ 
+ 		/* this is a resource error */
+ 		conn->flags |= CO_FL_ERROR;
++		RECORD_LEAVE(REC_TCP_CONN_SERVER);
+ 		return SF_ERR_RESOURCE;
+ 	}
+ 
+@@ -359,6 +369,7 @@ int tcp_connect_server(struct connection *conn, int flags)
+ 		close(fd);
+ 		conn->err_code = CO_ER_CONF_FDLIM;
+ 		conn->flags |= CO_FL_ERROR;
++		RECORD_LEAVE(REC_TCP_CONN_SERVER);
+ 		return SF_ERR_PRXCOND; /* it is a configuration limit */
+ 	}
+ 
+@@ -368,6 +379,7 @@ int tcp_connect_server(struct connection *conn, int flags)
+ 		close(fd);
+ 		conn->err_code = CO_ER_SOCK_ERR;
+ 		conn->flags |= CO_FL_ERROR;
++		RECORD_LEAVE(REC_TCP_CONN_SERVER);
+ 		return SF_ERR_INTERNAL;
+ 	}
+ 
+@@ -376,6 +388,7 @@ int tcp_connect_server(struct connection *conn, int flags)
+ 		close(fd);
+ 		conn->err_code = CO_ER_SOCK_ERR;
+ 		conn->flags |= CO_FL_ERROR;
++		RECORD_LEAVE(REC_TCP_CONN_SERVER);
+ 		return SF_ERR_INTERNAL;
+ 	}
+ 
+@@ -479,6 +492,7 @@ int tcp_connect_server(struct connection *conn, int flags)
+ 					 be->id);
+ 			}
+ 			conn->flags |= CO_FL_ERROR;
++			RECORD_LEAVE(REC_TCP_CONN_SERVER);
+ 			return SF_ERR_RESOURCE;
+ 		}
+ 	}
+@@ -539,6 +553,7 @@ int tcp_connect_server(struct connection *conn, int flags)
+ 			close(fd);
+ 			send_log(be, LOG_ERR, "Connect() failed for backend %s: %s.\n", be->id, msg);
+ 			conn->flags |= CO_FL_ERROR;
++			RECORD_LEAVE(REC_TCP_CONN_SERVER);
+ 			return SF_ERR_RESOURCE;
+ 		} else if (errno == ETIMEDOUT) {
+ 			//qfprintf(stderr,"Connect(): ETIMEDOUT");
+@@ -547,6 +562,7 @@ int tcp_connect_server(struct connection *conn, int flags)
+ 			close(fd);
+ 			conn->err_code = CO_ER_SOCK_ERR;
+ 			conn->flags |= CO_FL_ERROR;
++			RECORD_LEAVE(REC_TCP_CONN_SERVER);
+ 			return SF_ERR_SRVTO;
+ 		} else {
+ 			// (errno == ECONNREFUSED || errno == ENETUNREACH || errno == EACCES || errno == EPERM)
+@@ -556,6 +572,7 @@ int tcp_connect_server(struct connection *conn, int flags)
+ 			close(fd);
+ 			conn->err_code = CO_ER_SOCK_ERR;
+ 			conn->flags |= CO_FL_ERROR;
++			RECORD_LEAVE(REC_TCP_CONN_SERVER);
+ 			return SF_ERR_SRVCL;
+ 		}
+ 	}
+@@ -577,9 +594,11 @@ int tcp_connect_server(struct connection *conn, int flags)
+ 	if (conn_xprt_init(conn) < 0) {
+ 		conn_full_close(conn);
+ 		conn->flags |= CO_FL_ERROR;
++		RECORD_LEAVE(REC_TCP_CONN_SERVER);
+ 		return SF_ERR_RESOURCE;
+ 	}
+ 
++	RECORD_LEAVE(REC_TCP_CONN_SERVER);
+ 	return SF_ERR_NONE;  /* connection is OK */
+ }
+ 
+@@ -780,7 +799,9 @@ int tcp_bind_listener(struct listener *listener, char *errmsg, int errlen)
+ 	ext = (fd >= 0);
+ 
+ 	if (!ext) {
++        RECORD_ENTER(REC_SOCK_CREATE);
+ 		fd = my_socketat(listener->netns, listener->addr.ss_family, SOCK_STREAM, IPPROTO_TCP);
++        RECORD_LEAVE(REC_SOCK_CREATE);
+ 
+ 		if (fd == -1) {
+ 			err |= ERR_RETRYABLE | ERR_ALERT;
+diff --git a/src/stream.c b/src/stream.c
+index eeb0281be..50e3f736a 100644
+--- a/src/stream.c
++++ b/src/stream.c
+@@ -1497,6 +1497,9 @@ struct task *process_stream(struct task *t, void *context, unsigned short state)
+ 	struct stream_interface *si_f, *si_b;
+ 	unsigned int rate;
+ 
++	memset(ti->records, 0, sizeof(ti->records));
++	RECORD_ENTER(REC_PROC_STRM);
++
+ 	DBG_TRACE_ENTER(STRM_EV_STRM_PROC, s);
+ 
+ 	activity[tid].stream_calls++;
+@@ -2375,6 +2378,7 @@ struct task *process_stream(struct task *t, void *context, unsigned short state)
+ 		stream_release_buffers(s);
+ 
+ 		DBG_TRACE_DEVEL("queuing", STRM_EV_STRM_PROC, s);
++		RECORD_LEAVE(REC_PROC_STRM);
+ 		return t; /* nothing more to do */
+ 	}
+ 
+@@ -2428,6 +2432,7 @@ struct task *process_stream(struct task *t, void *context, unsigned short state)
+ 	/* the task MUST not be in the run queue anymore */
+ 	stream_free(s);
+ 	task_destroy(t);
++	RECORD_LEAVE(REC_PROC_STRM);
+ 	return NULL;
+ }
+ 
